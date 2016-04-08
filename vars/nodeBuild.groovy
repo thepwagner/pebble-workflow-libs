@@ -6,45 +6,63 @@ def call(body) {
     body.delegate = config
     body()
 
-    node {
-        stage 'Lint'
-        checkout scm
-        sh 'ls -l'
+    def registry = 'registry.private.com'
+    def imageName = "${config.name}:jenkins-${env.BUILD_ID}"
+    def containerName = config.name.replaceAll('-', '') + env.BUILD_ID
 
-        def nodeBuilds = [:]
-        for (def nodeVersion : config.versions) {
-            def thisVersion = nodeVersion
-            nodeBuilds["node${thisVersion}"] = {
-                node {
-                    checkout scm
-                    stage "Tests ${thisVersion}"
-                    print "Node build ${thisVersion}!"
-                    sh 'ls -l'
-                }
+    node {
+        // Build container:
+        stage 'Build'
+        checkout scm
+        sh "docker build -t ${imageName} ."
+
+        def nodeChecks = [:]
+        nodeChecks['Lint'] = {
+            node {
+                stage 'Lint'
+                sh "docker run --rm ${imageName} npm run lint"
             }
         }
-        parallel nodeBuilds
+        nodeChecks['Test'] = {
+            node {
+                stage 'Test'
+                sh """docker rm ${containerName} || true
+docker run --name ${containerName} ${imageName} npm run test
+mkdir -p build/
+docker cp ${containerName}:/app/build/tests.xml build/tests.xml
+docker rm ${containerName}
+"""
+                step([$class: 'JUnitResultArchiver', testResults: '**/build/tests.xml'])
+            }
+        }
 
-        stage 'Build'
-        node {
-            checkout scm
-            sh '''NPM_VERSION=`cat package.json | jq -r '.version'`
-VERSION_COMMIT=`git rev-list -n 1 $NPM_VERSION 2>/dev/null`
+        nodeChecks['Comments'] = {
+            node {
+                stage 'Comments'
+                checkout scm
+                step([$class: 'TasksPublisher', pattern: '**/*.js', high: 'FIXME', normal: 'TODO'])
+            }
+        }
+
+        parallel nodeChecks
+
+        if (env.BRANCH_NAME == 'master' || env.BRANCH_NAME =~ /^release.*/) {
+            stage "Publish"
+            sh """NPM_VERSION=`cat package.json | jq -r '.version'`
+VERSION_COMMIT=`git rev-list -n 1 \$NPM_VERSION 2>/dev/null || echo`
 CURRENT_COMMIT=`git log -1 --pretty=format:%H`
-echo $NPM_VERSION
-echo $VERSION_COMMIT
-echo $CURRENT_COMMIT
-if [ "$CURRENT_COMMIT" != "$VERSION_COMMIT" ]; then exit 1; fi
-'''
+if [ "\$CURRENT_COMMIT" = "\$VERSION_COMMIT" ]; then
+    git verify-tag \$NPM_VERSION
+    DOCKER_VERSION=\${NPM_VERSION}
+elif [ "\$BRANCH_NAME" = "master" ]; then
+    DOCKER_VERSION=latest
+else
+    DOCKER_VERSION=`echo \$BRANCH_NAME | sed 's!^release/!!g'`
+fi
+docker tag -f ${imageName} ${registry}/pebble/${config.name}:\${DOCKER_VERSION}
+docker push ${registry}/pebble/${config.name}:\${DOCKER_VERSION}
+"""
         }
-
-        stage 'Deploy'
-        node {
-            sh 'echo deploy'
-        }
-
-        stage 'post'
-        print "Goodbye"
     }
 }
 
